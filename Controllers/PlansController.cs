@@ -22,6 +22,8 @@ public sealed class PlansController(CatalogService catalog) : ApiController
                 request.Currency,
                 request.MonthlyAmountMinor,
                 request.YearlyAmountMinor,
+                request.ThreeMonthAmountMinor,
+                request.SixMonthAmountMinor,
                 request.TrialDays
             });
         }

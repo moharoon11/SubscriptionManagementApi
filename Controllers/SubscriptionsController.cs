@@ -9,6 +9,8 @@ namespace SubscriptionPlatform.Api.Controllers;
 [Authorize(Policy = "Application")]
 public sealed class SubscriptionsController(SubscriptionService subscriptions) : ApiController
 {
+    [HttpGet("by-customer/{externalId}")]
+    public async Task<IActionResult> GetByCustomer(string externalId) => Ok(await subscriptions.GetByExternalCustomerAsync(AppId, externalId));
     [HttpPost]
     public async Task<IActionResult> Create(CreateSubscriptionRequest request)
     {

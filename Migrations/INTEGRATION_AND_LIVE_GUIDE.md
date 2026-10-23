@@ -2,7 +2,7 @@
 
 This guide explains the purpose and current behavior of this API, how another application calls it, and what must be finished before accepting real payments. It is written for application developers and the team operating the API.
 
-> **Live-payment gate:** this repository is not yet ready to accept real payments. It creates Razorpay orders and checks checkout signatures, but it does not fetch the payment from Razorpay to confirm its captured state before activation. The Razorpay webhook path currently treats `payment.captured` as captured based on the event, but payment amount/currency/order consistency has not been fully reconciled. Recurring collection, refunds, invoices, automated integration tests, customer user authentication, and key rotation are also incomplete. Complete the “Required work before live” section and run end-to-end tests before switching any account to live credentials.
+> **Payment model:** fixed terms are prepaid one-time Razorpay orders, not automatic recurring mandates. The callback and captured-webhook paths now verify Razorpay's server-side payment state and reconcile the stored order, amount, and currency before activating access. Run the complete test-mode acceptance and deployment checklist below before using live credentials. Recurring collection, refunds, invoices, automated integration tests, customer-facing account/billing management, and application-key rotation remain separate production features and are not included in this fixed-term checkout.
 
 ## 1. What this project is for
 
@@ -11,7 +11,7 @@ SubscriptionPlatform is a server-side REST API that gives multiple registered ap
 An integration can use the API to:
 
 - Register an application identity and receive an application key.
-- Create and list application-owned plans with monthly/yearly prices, feature JSON, limits JSON, and trial duration.
+- Create and list application-owned plans with 3-month, 6-month, and 1-year prices, feature JSON, limits JSON, and trial duration.
 - Create and list application-owned customer records.
 - Start a free trial or create a pending paid subscription and Razorpay order.
 - Submit checkout results for server-side signature verification.
@@ -222,7 +222,11 @@ Requires an application bearer token. The integrating server forwards Razorpay's
 }
 ```
 
-The service computes HMAC-SHA256 for `order_id|payment_id` using the configured Razorpay key secret and constant-time compares it to the signature. It also compares the order ID with the order stored for this payment before updating rows. Valid verification returns `200`; a bad signature, order mismatch, or unknown payment currently returns `401`. Important: this endpoint does **not** fetch Razorpay's payment resource or confirm `captured` state and amount/currency against provider data before setting the local subscription active. That must be fixed before live use. Razorpay requires server-side signature verification and recommends fulfilment only after the required capture state is confirmed; see the [Razorpay integration guidance](https://razorpay.com/docs/server-integration/python/test-app/) and [security checklist](https://security.razorpay.com/security/checklist/).
+The service computes HMAC-SHA256 for `order_id|payment_id` using the configured Razorpay key secret and constant-time compares it to the signature. It fetches the payment from Razorpay, requires `captured`, and compares provider order ID, payment ID, amount, and currency against the stored payment/order before activation. A bad signature, mismatched provider data, unknown payment, or payment not yet captured is rejected. Razorpay requires server-side signature verification and recommends fulfilment only after the required capture state is confirmed; see the [Razorpay integration guidance](https://razorpay.com/docs/server-integration/python/test-app/) and [security checklist](https://security.razorpay.com/security/checklist/).
+
+### `POST /api/v1/payments/failure` — release a failed checkout attempt
+
+Requires an application bearer token. The trusted integrating backend sends `{ "paymentId": "<platform-payment-guid>", "orderId": "order_...", "externalCustomerId": "<its-own-user-id>" }` after the checkout SDK reports failure. The API verifies application ownership, external customer ownership, and the exact stored order, then closes the failed pending term so the customer may retry. It never changes a paid payment. Returns `200` if recorded or `409` when the payment is no longer pending/matching. An order abandoned without a callback expires after 30 minutes.
 
 ### `GET /api/v1/payments` — list payment history
 
@@ -230,9 +234,9 @@ Requires an application bearer token. Returns payment rows joined to subscriptio
 
 ### `POST /api/v1/webhooks/razorpay` — receive payment events
 
-No bearer token. Razorpay must send `X-Razorpay-Signature` and `X-Razorpay-Event-Id`. The service verifies the HMAC over the raw request body with `Razorpay:WebhookSecret`, then records the event ID under a unique database constraint. Duplicate event IDs return `200` with `duplicate=true`. `payment.captured` marks a matching order paid and activates its subscription; `payment.failed` marks it failed and puts the subscription into a three-day grace state. Unknown event types are acknowledged and recorded. Invalid signatures return `401`; a missing event ID returns `400`.
+No bearer token. Razorpay must send `X-Razorpay-Signature` and `X-Razorpay-Event-Id`. The service verifies the HMAC over the raw request body with `Razorpay:WebhookSecret`, then records the event ID under a unique database constraint. Duplicate event IDs return `200` with `duplicate=true`. For `payment.captured`, it fetches the provider payment and checks captured state, order ID, amount, and currency before activating. A signed `payment.failed` event closes the pending one-time term without granting grace access, so the customer can retry. Unknown event types are acknowledged and recorded. Invalid signatures/provider mismatches return `401`; a missing event ID returns `400`.
 
-This processing is not yet full payment reconciliation: it does not validate the event's amount, currency, merchant account, or captured status through a provider fetch; it does not retry failed processing through a durable queue; and it does not comprehensively reconcile out-of-order event histories. Razorpay describes webhooks as asynchronous signals and recommends verifying state for critical flows; see [Razorpay payment status and webhook guidance](https://razorpay.com/docs/server-integration/python/test-app/) and [payment event behavior](https://razorpay.com/docs/payments/payments/dashboard/?preferred-country=IN).
+Webhook event IDs are persisted for duplicate suppression, but there is no durable retry queue for transient database/provider failures and no comprehensive reconciliation job for out-of-order event histories. Razorpay describes webhooks as asynchronous signals and recommends verifying state for critical flows; see [Razorpay payment status and webhook guidance](https://razorpay.com/docs/server-integration/python/test-app/) and [payment event behavior](https://razorpay.com/docs/payments/payments/dashboard/?preferred-country=IN).
 
 ### `GET /health/live` and `GET /health/ready` — platform probes
 
@@ -298,7 +302,7 @@ This is an operator checklist, not a claim that deployment has already been perf
 
 The items below are real gaps in the checked-in implementation, not optional setup steps:
 
-1. **Fetch and reconcile each payment.** After callback signature validation, fetch the payment/order from Razorpay's server API or SDK. Compare stored order ID, provider payment ID, amount, currency, and account; activate only when the provider state meets the capture policy. Current callback verification updates `paid`/`active` after signature and stored-order match alone.
+1. **Validate callback and webhook payment reconciliation in test mode.** Both paths fetch provider state before activation and compare order, amount, and currency. Exercise captured, delayed, duplicate, and mismatched events against the configured merchant account before launch.
 2. **Make webhook transitions trustworthy and replay-safe.** Verify against raw request bytes, validate event shape, reconcile amount/currency/payment/order/account, handle capture versus authorization correctly, and persist processing state/errors for durable retries. Ensure out-of-order events cannot regress a final state. The current event table records deduplication but does not implement a durable retry queue or complete reconciliation.
 3. **Implement actual recurring billing.** Schedule and create renewal charges/orders, retry failed renewals with idempotency, reconcile provider events, and support dunning/grace/cancellation transitions. The current worker only expires local periods; it does not charge renewals.
 4. **Implement cancellation semantics.** Make `cancel_at_period_end` cause the correct status transition at the end date and ensure no future renewal is charged. Current cancellation is a flag and the worker expires periods without checking that flag.
@@ -310,3 +314,83 @@ The items below are real gaps in the checked-in implementation, not optional set
 10. **Run security and operational review.** Verify rate limits per client/IP/tenant, request size limits, HTTPS/proxy configuration, secret rotation, database backups/PITR, dependency vulnerability scans, least privilege, audit retention, monitoring/alerts, incident response, and disaster recovery.
 
 Until these blockers are completed and verified, deploy only to local development or isolated staging using test credentials. A successful build alone is not proof of production readiness.
+
+## 9. StoreManagement Flutter + Store API integration
+
+This repository is the subscription backend. The sibling projects use it through the StoreManagement API, so the Flutter binary contains no Subscription Platform application key, Razorpay secret, or webhook secret.
+
+### Available checkout terms
+
+- **Free trial:** one trial per platform customer, using `trialDays` configured on the plan. This does not create a Razorpay order and does not automatically convert to a paid plan.
+- **3 months:** prepaid one-time Razorpay order; access starts only after server verification and lasts three calendar months.
+- **6 months:** prepaid one-time Razorpay order; access lasts six calendar months.
+- **1 year:** prepaid one-time Razorpay order; access lasts twelve calendar months.
+
+The fixed paid terms do not renew automatically. The customer must purchase another term after expiry. These are not Razorpay recurring subscriptions/mandates.
+
+### Store API routes used by Flutter
+
+All routes below are under the Store API `/api` base and require the Store API's normal user JWT.
+
+| Route | Purpose |
+|---|---|
+| `GET /subscription/options` | Returns the configured plan and its trial duration, currency, and prices. Flutter displays only terms whose prices are greater than zero. |
+| `GET /subscription/status` | Returns the logged-in Store user’s latest subscription status and access flag. |
+| `POST /subscription/start` | Starts an eligible trial or creates a Razorpay order for `three_month`, `six_month`, or `one_year`. The Store API derives the customer from the signed-in user; clients cannot choose another customer or plan. |
+| `POST /subscription/verify` | Sends Razorpay Checkout’s payment ID, order ID, and signature to the platform. Access remains locked unless the platform verifies the signature and confirms a captured payment with matching order, amount, and currency. |
+| `POST /subscription/failure` | Records a failed Checkout attempt against the current Store user and order so the customer can try another term/order. It cannot mark a paid payment failed. |
+
+The Flutter app opens Razorpay Checkout with the platform's returned Key ID, order ID, amount in minor units, and currency. A client success callback by itself does not unlock the application. Failed checkout callbacks are reported so the customer can retry; an order abandoned without a callback expires after 30 minutes. The Store API applies an access check to protected business routes and returns HTTP `402` when there is no valid trial or paid term; login, profile setup, health, and subscription routes remain available. Subscription-platform outages fail closed for protected routes with HTTP `503`.
+
+### Configure StoreManagement API
+
+Set these values in the Store API host's environment/secret manager, not in Flutter, and restart the Store API:
+
+```text
+SubscriptionPlatform__BaseUrl=https://<subscription-platform-host>
+SubscriptionPlatform__ApplicationKey=<application-key-issued-by-platform-admin>
+SubscriptionPlatform__PlanId=<plan-guid-created-for-this-integration>
+```
+
+The platform Application Key is server-to-server only. The Store API obtains and caches an application JWT. Each distinct integrating application should have its own platform application record and plan mapping. The current platform Razorpay merchant keys remain global: all integrations settle to the single merchant configured on the platform, not to separate app owners. Configure the Store API's own `ConnectionStrings__DefaultConnection` and `JwtSettings__SecretKey` in its host secret manager as well; checked-in fallback credentials have been removed. Rotate any database or JWT credentials that were previously committed, since deleting a value from the latest file does not remove it from old Git history.
+
+### Configure plan prices
+
+After registering the Store API integration, use its application key to create one plan through `POST /api/v1/plans` on the Subscription Platform. Example (replace prices with approved amounts; values are paise for INR):
+
+```json
+{
+  "name": "BillMate",
+  "currency": "INR",
+  "monthlyAmountMinor": 0,
+  "threeMonthAmountMinor": 149700,
+  "sixMonthAmountMinor": 269700,
+  "yearlyAmountMinor": 479400,
+  "trialDays": 7,
+  "featuresJson": "{}",
+  "limitsJson": "{}"
+}
+```
+
+Copy the returned `id` to the Store API's `SubscriptionPlatform__PlanId`. Enter actual commercial prices and supported currency; the sample values are illustrative only. Do not send customer-provided prices to create orders.
+
+### Razorpay dashboard setup for real payments
+
+1. Complete merchant onboarding, business verification, settlement bank setup, and required website/app details in the Razorpay Dashboard for the jurisdiction and account.
+2. In **Test Mode**, generate test API Key ID and Key Secret. Configure them only in the Subscription Platform host's secret manager as `Razorpay__KeyId` and `Razorpay__KeySecret`.
+3. Create a test webhook for `https://<subscription-platform-host>/api/v1/webhooks/razorpay`. Subscribe to `payment.captured` and `payment.failed`, copy the webhook secret, and configure it as `Razorpay__WebhookSecret`. The webhook secret is separate from the API Key Secret.
+4. Deploy the Subscription Platform and Store API to HTTPS staging, create a test application and plan, configure the Store API environment values above, then install/build the Flutter app with that Store API base URL.
+5. Test a successful captured test payment, failed/abandoned checkout, duplicate callback, duplicate webhook, delayed webhook, and platform outage. Confirm an unsuccessful or merely authorized payment never unlocks access.
+6. After staging sign-off and Razorpay live activation, switch to **Live Mode**, generate live API credentials, and set the live key ID/key secret and live webhook secret in the production secret manager. Create the production webhook at the production URL with the same two events. Keep test and live credentials separate; never put either Key Secret in `--dart-define`, Dart source, the APK, or logs.
+7. Make sure live payment capture is enabled or captured through the supported merchant flow. The current service grants access only to a Razorpay payment whose fetched status is `captured`.
+8. Release the Flutter client configured to call the production Store API. Monitor Razorpay payment/webhook dashboards and platform/store API logs; reconcile settlements and payment records regularly.
+
+Razorpay account activation requirements and Dashboard labels can vary. Use Razorpay's official current [test and go-live guidance](https://razorpay.com/docs/server-integration/python/test-app/) and [security checklist](https://security.razorpay.com/security/checklist/) when performing the dashboard steps. Never use real card details in test mode or test credentials for live payments.
+
+### Database upgrade for an existing deployment
+
+For a brand-new database, apply the updated `001_initial.sql` only. For an existing database created using the prior version of `001_initial.sql`, back up the database and apply `002_fixed_term_prices.sql` once. Do not apply migration 002 after the updated initial schema, because its columns already exist. Record migration execution in your deployment system; the API does not run migrations automatically.
+
+### Flutter build and payment boundary
+
+The Flutter project depends on `razorpay_flutter` for Android/iOS native Checkout. Its Dart code receives only the public Key ID and server-created order details at runtime. Configure the existing Store API URL using the Flutter project's `API_BASE_URL` build define. Do not configure the Subscription Platform URL or application key in Flutter. This checkout package does not provide native web support; a future web client needs an appropriate hosted/web checkout implementation.

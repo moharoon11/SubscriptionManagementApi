@@ -9,6 +9,13 @@ namespace SubscriptionPlatform.Api.Controllers;
 [Authorize(Policy = "Application")]
 public sealed class PaymentsController(PaymentService payments) : ApiController
 {
+    [HttpPost("failure")]
+    public async Task<IActionResult> Failure(FailedPaymentRequest request)
+    {
+        var recorded = await payments.MarkFailedAsync(AppId, request.PaymentId, request.OrderId, request.ExternalCustomerId);
+        return recorded ? Ok(new { status = "failed" }) : Conflict(new { error = "payment_not_pending" });
+    }
+
     [HttpPost("verify")]
     public async Task<IActionResult> Verify(VerifyPaymentRequest request)
     {

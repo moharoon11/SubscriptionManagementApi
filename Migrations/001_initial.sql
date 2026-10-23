@@ -8,12 +8,13 @@ CREATE TABLE IF NOT EXISTS registered_applications (
 CREATE TABLE IF NOT EXISTS plans (
  id CHAR(36) PRIMARY KEY, application_id CHAR(36) NOT NULL, name VARCHAR(120) NOT NULL,
  currency CHAR(3) NOT NULL, monthly_amount_minor BIGINT NOT NULL, yearly_amount_minor BIGINT NOT NULL,
+ three_month_amount_minor BIGINT NOT NULL DEFAULT 0, six_month_amount_minor BIGINT NOT NULL DEFAULT 0,
  trial_days INT NOT NULL DEFAULT 7, features_json JSON NOT NULL, limits_json JSON NOT NULL, active BOOLEAN NOT NULL DEFAULT TRUE,
  UNIQUE KEY uq_plan_name(application_id,name), CONSTRAINT fk_plan_app FOREIGN KEY(application_id) REFERENCES registered_applications(id)
 );
 CREATE TABLE IF NOT EXISTS customers (
  id CHAR(36) PRIMARY KEY, application_id CHAR(36) NOT NULL, external_id VARCHAR(200) NOT NULL,
- email VARCHAR(320) NOT NULL, created_utc DATETIME(6) NOT NULL, UNIQUE KEY uq_customer_external(application_id,external_id),
+ email VARCHAR(320) NULL, created_utc DATETIME(6) NOT NULL, UNIQUE KEY uq_customer_external(application_id,external_id),
  CONSTRAINT fk_customer_app FOREIGN KEY(application_id) REFERENCES registered_applications(id)
 );
 CREATE TABLE IF NOT EXISTS subscriptions (
